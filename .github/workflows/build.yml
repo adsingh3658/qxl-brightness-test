@@ -1,60 +1,98 @@
-
-name: Build QXL Brightness Driver
+name: Build QXL Brightness Driver (compile and link probe)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-2022
-
     steps:
-      - name: Checkout modified source
+      - name: Checkout QXL source
         uses: actions/checkout@v4
 
-      - name: Locate MSBuild
-        id: toolchain
+      - name: Restore SPICE include dependency
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $includeRoot = Join-Path $env:GITHUB_WORKSPACE 'qxldod\Include'
+          $wanted = Join-Path $includeRoot 'include\types.h'
+          if (!(Test-Path $includeRoot)) { throw "Missing expected QXL folder: $includeRoot" }
+          New-Item -ItemType Directory -Force -Path (Split-Path $wanted) | Out-Null
+          if (!(Test-Path $wanted)) {
+            $candidate = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'qxldod') -Filter 'types.h' -Recurse -File |
+              Where-Object { $_.FullName -ne $wanted } | Select-Object -First 1
+            if ($candidate) {
+              Write-Host "Reusing existing source header: $($candidate.FullName)"
+              Copy-Item -LiteralPath $candidate.FullName -Destination $wanted
+            } else {
+              # Source: Debian spice-protocol 0.12.14 (legacy SPICE protocol declarations)
+              $uri = 'https://sources.debian.org/data/main/s/spice-protocol/0.12.14-1/spice/types.h'
+              Write-Host "Fetching missing SPICE types.h: $uri"
+              Invoke-WebRequest -Uri $uri -OutFile $wanted -UseBasicParsing
+              if ((Get-Item $wanted).Length -lt 200) { throw 'Downloaded types.h is unexpectedly short.' }
+            }
+          }
+          Write-Host "Resolved header: $wanted"
+
+      - name: Find MSBuild and WDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) { throw 'vswhere.exe not found' }
           $msbuild = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
-
-          if (!$msbuild) {
-            throw "MSBuild was not found"
-          }
-
+          if (!$msbuild) { throw 'MSBuild not found' }
+          Write-Host "MSBuild: $msbuild"
           "MSBUILD_PATH=$msbuild" >> $env:GITHUB_ENV
+          $wdk = "${env:ProgramFiles(x86)}\Windows Kits\10\build\10.0.26100.0\WindowsDriver.common.targets"
+          if (!(Test-Path $wdk)) { throw "Required WDK targets missing: $wdk" }
 
-      - name: Compile QXL driver
+      - name: Compile and link driver without packaging
         shell: pwsh
+        env:
+          # Suppress ONLY the deprecated allocation API warning in legacy QXL source.
+          CL: /wd4996
         run: |
-          & $env:MSBUILD_PATH "qxldod/qxldod.vcxproj" `
-            /t:Build `
-            /p:Configuration=Win10Debug_NoSign `
-            /p:Platform=x64 `
-            /m `
-            /v:minimal `
-            /fl `
-            "/flp:logfile=build.log;verbosity=diagnostic"
+          $ErrorActionPreference = 'Stop'
+          # ClCompile/Link bypass broken automatic INF validation during this diagnostic build.
+          # This does NOT produce a signed, installable driver package.
+          $project = 'qxldod\qxldod.vcxproj'
+          $args = @(
+            $project,
+            '/t:ClCompile;Link',
+            '/p:Configuration=Win10Debug_NoSign',
+            '/p:Platform=x64',
+            '/v:minimal',
+            '/fl',
+            '/flp:logfile=build.log;verbosity=normal'
+          )
+          & $env:MSBUILD_PATH @args
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild compile/link failed with code $LASTEXITCODE" }
+          $sys = @(Get-ChildItem -Path . -Filter 'qxldod.sys' -File -Recurse)
+          if ($sys.Count -eq 0) { throw 'Compilation finished but qxldod.sys was not produced.' }
+          $sys | ForEach-Object { Write-Host "Generated: $($_.FullName)" }
 
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-      - name: Upload build log
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qxl-build-log
-          path: build.log
-          if-no-files-found: ignore
+          name: qxl-compile-logs
+          path: |
+            build.log
+            **/*.tlog
+          if-no-files-found: warn
 
-      - name: Upload compiled driver
+      - name: Upload unsigned experimental binary
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: qxl-brightness-driver
+          name: qxl-brightness-UNSIGNED-DO-NOT-INSTALL
           path: |
             **/qxldod.sys
             **/qxldod.pdb
-          if-no-files-found: warn
+          if-no-files-found: error
