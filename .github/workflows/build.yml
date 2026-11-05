@@ -82,7 +82,7 @@ jobs:
           $project = 'qxldod\qxldod.vcxproj'
           $args = @(
             $project,
-            '/t:ClCompile;Link',
+            '/t:BuildCompile;BuildLink',
             '/p:Configuration=Win10Debug_NoSign',
             '/p:Platform=x64',
             '/v:minimal',
