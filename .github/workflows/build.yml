@@ -39,6 +39,24 @@ jobs:
           }
           Write-Host "Resolved header: $wanted"
 
+          # Fix the legacy SPICE header's non-standard stdint include.
+          # This changes only the temporary CI build copy.
+          $header = [System.IO.File]::ReadAllText($wanted)
+
+          if ($header.Contains('include/stdint.h')) {
+            Write-Host "Correcting legacy stdint.h include"
+            $header = $header.Replace('include/stdint.h', 'stdint.h')
+            [System.IO.File]::WriteAllText(
+              $wanted,
+              $header,
+              [System.Text.UTF8Encoding]::new($false)
+            )
+          }
+
+          Write-Host "SPICE types.h dependency lines:"
+          Get-Content $wanted |
+            Select-String -Pattern 'include.*stdint'
+
       - name: Find MSBuild and WDK
         shell: pwsh
         run: |
