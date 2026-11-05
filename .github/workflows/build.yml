@@ -132,6 +132,36 @@ jobs:
 
           Write-Host "DIAGNOSTIC DRIVER BINARY VERIFIED"
           Write-Host "UNSIGNED - DO NOT INSTALL"
+
+          # A nonzero MSBuild result is acceptable for this diagnostic
+          # build ONLY when the sole error is the known INF-copy failure.
+          if ($buildExit -ne 0) {
+            if (!(Test-Path 'build.log')) {
+              throw "Build log missing; cannot verify packaging failure."
+            }
+
+            $errors = @(
+              Select-String -Path 'build.log' `
+                -Pattern 'error (MSB|C|LNK)[0-9]+:'
+            )
+
+            $unexpected = @(
+              $errors | Where-Object {
+                $_.Line -notmatch 'error MSB3030:.*qxldod\\.inf'
+              }
+            )
+
+            if ($errors.Count -eq 0 -or $unexpected.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host $_.Line }
+              throw "Unexpected build failure; refusing to report success."
+            }
+
+            Write-Host "Confirmed: only known INF-copy error remains."
+          }
+
+          # Explicitly clear the native command exit code after validation.
+          $global:LASTEXITCODE = 0
+          exit 0
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
