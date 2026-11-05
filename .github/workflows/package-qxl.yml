@@ -1,0 +1,133 @@
+name: Package Existing QXL Brightness Binary (TEST ONLY)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: windows-2022
+    steps:
+      - name: Download existing compiled QXL binary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh run download 42009469961 --repo $env:GITHUB_REPOSITORY --name qxl-brightness-UNSIGNED-DO-NOT-INSTALL --dir downloaded
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download build artifact' }
+          $driver = Get-ChildItem downloaded -Recurse -Filter qxldod.sys -File | Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $driver -or $driver.Length -lt 4096) { throw 'Compiled qxldod.sys not found' }
+          New-Item -ItemType Directory package -Force | Out-Null
+          Copy-Item $driver.FullName package/qxldod.sys
+          Write-Host "Selected compiled driver: $($driver.FullName) ($($driver.Length) bytes)"
+
+      - name: Create Windows 11 QXL test INF
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inf = @'
+          [Version]
+          Signature="$WINDOWS NT$"
+          Class=Display
+          ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
+          Provider=%ProviderName%
+          DriverVer=11/05/2026,100.0.0.13001
+          CatalogFile=qxldod.cat
+          PnpLockdown=1
+
+          [Manufacturer]
+          %ProviderName%=QXL,NTamd64
+
+          [QXL.NTamd64]
+          %DeviceName%=QXL_Install,PCI\VEN_1B36&DEV_0100&SUBSYS_11001AF4
+
+          [QXL_Install.NT]
+          FeatureScore=F9
+          CopyFiles=QXL_Files
+
+          [QXL_Install.NT.Services]
+          AddService=QxlDod,0x00000002,QXL_Service
+
+          [QXL_Service]
+          DisplayName=%DeviceName%
+          ServiceType=1
+          StartType=3
+          ErrorControl=1
+          ServiceBinary=%13%\qxldod.sys
+
+          [DestinationDirs]
+          QXL_Files=13
+
+          [QXL_Files]
+          qxldod.sys
+
+          [SourceDisksNames]
+          1=%DiskName%,,,
+
+          [SourceDisksFiles]
+          qxldod.sys=1
+
+          [Strings]
+          ProviderName="QXL Brightness Test"
+          DeviceName="Red Hat QXL Brightness Test"
+          DiskName="QXL Brightness Test Driver"
+          '@
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'package/qxldod.inf'), $inf, [System.Text.Encoding]::ASCII)
+          Write-Host 'Prepared test-only QXL INF.'
+
+      - name: Find WDK signing utilities
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $inf2cat = Get-ChildItem $root -Filter Inf2Cat.exe -Recurse -File | Sort-Object FullName -Descending | Select-Object -First 1
+          $signtool = Get-ChildItem $root -Filter signtool.exe -Recurse -File | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$inf2cat -or !$signtool) { throw 'WDK Inf2Cat or x64 SignTool missing' }
+          "INF2CAT=$($inf2cat.FullName)" >> $env:GITHUB_ENV
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          Write-Host "Inf2Cat: $($inf2cat.FullName)"
+          Write-Host "SignTool: $($signtool.FullName)"
+
+      - name: Create ephemeral test cert and sign binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=QXL Temporary VM Test Certificate' -CertStoreLocation Cert:\CurrentUser\My -HashAlgorithm SHA256 -KeyAlgorithm RSA -KeyLength 3072 -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddDays(30)
+          if (!$cert) { throw 'Certificate creation failed' }
+          Export-Certificate -Cert $cert -FilePath package/qxl-test-public.cer | Out-Null
+          "TEST_CERT_SHA1=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+          & $env:SIGNTOOL sign /v /fd SHA256 /s My /sha1 $cert.Thumbprint package/qxldod.sys
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to test-sign the driver binary' }
+
+      - name: Generate and sign INF catalog
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $folder = (Resolve-Path package).Path
+          & $env:INF2CAT "/driver:$folder" '/os:10_X64' '/uselocaltime' '/verbose'
+          if ($LASTEXITCODE -ne 0) { throw 'Inf2Cat failed: test package INF needs correction' }
+          if (!(Test-Path package/qxldod.cat)) { throw 'Inf2Cat did not produce qxldod.cat' }
+          & $env:SIGNTOOL sign /v /fd SHA256 /s My /sha1 $env:TEST_CERT_SHA1 package/qxldod.cat
+          if ($LASTEXITCODE -ne 0) { throw 'Could not test-sign catalog' }
+          Write-Host 'TEST PACKAGE CREATED. Not production signed.'
+          Write-Host 'Do not use outside an isolated Windows VM with test-signing enabled.'
+
+      - name: Upload test package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QXL-VM-TEST-PACKAGE-SIGNED-NOT-PRODUCTION
+          path: package/
+          if-no-files-found: error
+
+      - name: Upload diagnostic INF and logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qxl-package-diagnostics
+          path: package/*.inf
+          if-no-files-found: ignore
