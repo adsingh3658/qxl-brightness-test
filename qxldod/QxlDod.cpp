@@ -644,15 +644,100 @@ NTSTATUS QxlDod::PresentDisplayOnly(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY* pPre
     return Status;
 }
 
+// QXL_NATIVE_BRIGHTNESS_BEGIN
+// Single-output QXL brightness v1 prototype. Stores the virtual brightness
+// state for the Windows monitor stack; does not physically dim QXL pixels.
+// This guest-side value is read by the Windows WMI brightness provider and a
+// user-session bridge applies the visual effect. Only for a disposable test VM.
+static volatile LONG g_QxlVirtualBrightness = 100;
+
+static VOID NTAPI QxlBrightnessReference(PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+}
+
+static VOID NTAPI QxlBrightnessDereference(PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+}
+
+static NTSTATUS NTAPI QxlBrightnessGetPossible(
+    PVOID Context, ULONG BufferSize, PUCHAR LevelCount, PUCHAR BrightnessLevels)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(Context);
+    // Element 0: default AC level. Element 1: default DC level.
+    // Remaining elements: supported brightness levels in ascending order.
+    const UCHAR levels[] = {
+        100, 80,
+        0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50,
+        55, 60, 65, 70, 75, 80, 85, 90, 95, 100
+    };
+    if (!LevelCount || !BrightnessLevels)
+        return STATUS_INVALID_PARAMETER;
+    *LevelCount = (UCHAR)sizeof(levels);
+    if (BufferSize < sizeof(levels))
+        return STATUS_BUFFER_TOO_SMALL;
+    RtlCopyMemory(BrightnessLevels, levels, sizeof(levels));
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI QxlBrightnessSet(PVOID Context, UCHAR Brightness)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(Context);
+    if (Brightness > 100)
+        return STATUS_INVALID_PARAMETER;
+    InterlockedExchange(&g_QxlVirtualBrightness, (LONG)Brightness);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI QxlBrightnessGet(PVOID Context, PUCHAR Brightness)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(Context);
+    if (!Brightness)
+        return STATUS_INVALID_PARAMETER;
+    *Brightness = (UCHAR)InterlockedCompareExchange(
+        &g_QxlVirtualBrightness, 0, 0);
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS QxlDod::QueryInterface(_In_ CONST PQUERY_INTERFACE pQueryInterface)
 {
     PAGED_CODE();
-    QXL_ASSERT(pQueryInterface != NULL);
+    if (!pQueryInterface || !pQueryInterface->InterfaceType ||
+        !pQueryInterface->Interface)
+        return STATUS_INVALID_PARAMETER;
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s Version = %d\n", __FUNCTION__, pQueryInterface->Version));
+    // GUID_DEVINTERFACE_BRIGHTNESS {FDE5BBA4-B3F9-46FB-BDAA-0728CE3100B4}
+    const GUID brightnessGuid = {
+        0xFDE5BBA4, 0xB3F9, 0x46FB,
+        {0xBD, 0xAA, 0x07, 0x28, 0xCE, 0x31, 0x00, 0xB4}
+    };
+    if (!RtlEqualMemory(pQueryInterface->InterfaceType,
+                        &brightnessGuid, sizeof(GUID)) ||
+        pQueryInterface->Version != DXGK_BRIGHTNESS_INTERFACE_VERSION_1)
+        return STATUS_NOT_SUPPORTED;
 
-    return STATUS_NOT_SUPPORTED;
+    if (pQueryInterface->Size < sizeof(DXGK_BRIGHTNESS_INTERFACE))
+        return STATUS_BUFFER_TOO_SMALL;
+
+    PDXGK_BRIGHTNESS_INTERFACE iface =
+        (PDXGK_BRIGHTNESS_INTERFACE)pQueryInterface->Interface;
+    RtlZeroMemory(iface, sizeof(*iface));
+    iface->Size = (USHORT)sizeof(*iface);
+    iface->Version = DXGK_BRIGHTNESS_INTERFACE_VERSION_1;
+    iface->Context = this;
+    iface->InterfaceReference = QxlBrightnessReference;
+    iface->InterfaceDereference = QxlBrightnessDereference;
+    iface->GetPossibleBrightness = QxlBrightnessGetPossible;
+    iface->SetBrightness = QxlBrightnessSet;
+    iface->GetBrightness = QxlBrightnessGet;
+    return STATUS_SUCCESS;
 }
+// QXL_NATIVE_BRIGHTNESS_END
+
 
 NTSTATUS QxlDod::StopDeviceAndReleasePostDisplayOwnership(_In_  D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
                                                           _Out_ DXGK_DISPLAY_INFORMATION*      pDisplayInfo)
